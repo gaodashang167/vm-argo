@@ -1,6 +1,9 @@
 #!/bin/bash
 # =========================
-# Argo + VMess + WS 安装脚本 (最终修复版)
+# Argo + VMess + WS 安装脚本 (IPv6 专用修复版)
+# 1. 自动识别纯 IPv6 环境并强制 Argo 使用 v6
+# 2. 修复 hu 命令下载问题
+# 3. 修复固定隧道刷新问题
 # =========================
 
 export LANG=en_US.UTF-8
@@ -26,9 +29,9 @@ work_dir="/etc/sing-box"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
 
-# ⚠️ 脚本的在线地址 (用于 hu 命令自动更新和下载)
+# GitHub 地址
 GITHUB_URL="https://raw.githubusercontent.com/gaodashang167/vm-argo/main/vm.sh"
-# 本地保存的文件名 (现在统一改为 vm.sh)
+# 本地保存文件名
 LOCAL_SCRIPT="${work_dir}/vm.sh"
 
 export vmess_port=${PORT:-8001}
@@ -37,6 +40,18 @@ export CFPORT=${CFPORT:-'443'}
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本" && exit 1
+
+# === 网络环境检测函数 (核心修复) ===
+check_network_env() {
+    # 检测是否有 IPv4 出口
+    if curl -4 -s --connect-timeout 2 https://1.1.1.1 >/dev/null 2>&1; then
+        echo "auto"
+    else
+        echo "6" # 纯 IPv6 环境返回 6
+    fi
+}
+# 获取当前环境的最佳 Argo 参数
+ARGO_EDGE_IP=$(check_network_env)
 
 # 检查命令是否存在
 command_exists() {
@@ -114,6 +129,7 @@ install_singbox() {
 
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}"
     
+    # 下载必要文件
     curl -sLo "${work_dir}/qrencode" "https://$ARCH.ssss.nyc.mn/qrencode"
     curl -sLo "${work_dir}/sing-box" "https://$ARCH.ssss.nyc.mn/sbx"
     curl -sLo "${work_dir}/argo" "https://$ARCH.ssss.nyc.mn/bot"
@@ -123,6 +139,8 @@ install_singbox() {
     uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     nginx_port=$(shuf -i 2000-65000 -n 1)
+    
+    # 智能 DNS 策略
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
 
 cat > "${config_dir}" << EOF
@@ -136,7 +154,7 @@ cat > "${config_dir}" << EOF
 EOF
 }
 
-# Systemd服务
+# Systemd服务 (已注入 IPv6 判断)
 main_systemd_services() {
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
@@ -157,6 +175,7 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF
 
+    # 这里的 ARGO_EDGE_IP 是动态检测的结果
     cat > /etc/systemd/system/argo.service << EOF
 [Unit]
 Description=Cloudflare Tunnel
@@ -165,7 +184,7 @@ After=network.target
 Type=simple
 NoNewPrivileges=yes
 TimeoutStartSec=0
-ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://localhost:$vmess_port --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
+ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://localhost:$vmess_port --no-autoupdate --edge-ip-version $ARGO_EDGE_IP --protocol http2 > /etc/sing-box/argo.log 2>&1"
 Restart=on-failure
 RestartSec=5s
 [Install]
@@ -181,7 +200,7 @@ EOF
     systemctl start sing-box argo
 }
 
-# OpenRC服务
+# OpenRC服务 (已注入 IPv6 判断)
 alpine_openrc_services() {
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
@@ -195,7 +214,7 @@ EOF
 #!/sbin/openrc-run
 description="Cloudflare Tunnel"
 command="/bin/sh"
-command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:$vmess_port --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
+command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:$vmess_port --no-autoupdate --edge-ip-version $ARGO_EDGE_IP --protocol http2 > /etc/sing-box/argo.log 2>&1'"
 command_background=true
 pidfile="/var/run/argo.pid"
 EOF
@@ -204,7 +223,7 @@ EOF
     rc-update add argo default > /dev/null 2>&1
 }
 
-# 获取信息 (支持固定隧道)
+# 获取信息
 get_info() {
     if [ -z "$uuid" ] && [ -f "$config_dir" ]; then
         command_exists jq && uuid=$(jq -r '.inbounds[0].users[0].uuid' "$config_dir") || uuid=$(grep -o '"uuid": *"[^"]*"' "$config_dir" | head -1 | cut -d'"' -f4)
@@ -232,7 +251,7 @@ get_info() {
     else
         green "\n检测到固定隧道配置: ${argodomain}"
     fi
-    [ -z "$argodomain" ] && red "获取 Argo 域名失败，请检查网络或配置" && return
+    [ -z "$argodomain" ] && red "获取 Argo 域名失败，纯 IPv6 请多等待一会或检查网络" && return
 
     green "\nArgo域名：${purple}$argodomain${re}\n"
     VMESS="{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowlnsecure\": \"false\"}"
@@ -261,7 +280,6 @@ server {
     location / { return 404; } location ~ /\. { deny all; access_log off; }
 }
 EOF
-    # 简单的Nginx配置修复逻辑
     if [ ! -f "/etc/nginx/nginx.conf" ]; then
         cat > /etc/nginx/nginx.conf << EOF
 user nginx; worker_processes auto; error_log /var/log/nginx/error.log; pid /run/nginx.pid;
@@ -308,21 +326,12 @@ uninstall_singbox() {
     green "\n卸载成功\n" && exit 0
 }
 
-# 创建快捷指令 (核心修复)
+# 创建快捷指令
 create_shortcut() {
     yellow "\n配置快捷指令 hu..."
-    
-    # 1. 尝试下载脚本
     curl -sLo "$LOCAL_SCRIPT" "$GITHUB_URL"
     chmod +x "$LOCAL_SCRIPT"
     
-    # 2. 检查下载是否成功
-    if [ ! -s "$LOCAL_SCRIPT" ]; then
-        red "警告：从 GitHub 下载脚本失败！"
-        yellow "hu 命令可能需要网络通畅才能自动修复。"
-    fi
-
-    # 3. 创建命令文件
     cat > "/usr/bin/hu" << EOF
 #!/bin/bash
 if [ -s "$LOCAL_SCRIPT" ]; then
@@ -332,15 +341,11 @@ else
     mkdir -p "$work_dir"
     curl -sLo "$LOCAL_SCRIPT" "$GITHUB_URL"
     chmod +x "$LOCAL_SCRIPT"
-    if [ -s "$LOCAL_SCRIPT" ]; then
-        bash "$LOCAL_SCRIPT" \$1
-    else
-        echo -e "\033[1;91m下载失败，请检查网络或 GitHub 地址。\033[0m"
-    fi
+    [ -s "$LOCAL_SCRIPT" ] && bash "$LOCAL_SCRIPT" \$1 || echo -e "\033[1;91m下载失败\033[0m"
 fi
 EOF
     chmod +x "/usr/bin/hu"
-    green "\n>>> 快捷指令 hu 创建成功！以后输入 hu 即可管理脚本 <<<\n"
+    green "\n>>> 快捷指令 hu 已配置 (纯 IPv6 适配版) <<<\n"
 }
 
 # Alpine适配
@@ -359,6 +364,9 @@ setup_argo_fixed() {
     [ -z "$argo_domain" ] || [ -z "$argo_auth" ] && red "不能为空" && return
     stop_argo >/dev/null 2>&1
     
+    # 动态参数
+    EDGE_ARG="--edge-ip-version $ARGO_EDGE_IP"
+    
     if [[ $argo_auth =~ TunnelSecret ]]; then
         echo "$argo_auth" > "${work_dir}/tunnel.json"
         TUNNEL_ID=$(cut -d\" -f12 <<< "$argo_auth")
@@ -372,11 +380,10 @@ ingress:
     originRequest: { noTLSVerify: true }
   - service: http_status:404
 EOF
-        CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'"
+        CMD_ARGS="-c '/etc/sing-box/argo tunnel $EDGE_ARG --config /etc/sing-box/tunnel.yml run 2>&1'"
     else
-        # Token模式: 写入假的yml仅供get_info读取域名
         echo "hostname: $argo_domain" > "${work_dir}/tunnel.yml"
-        CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'"
+        CMD_ARGS="-c '/etc/sing-box/argo tunnel $EDGE_ARG --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'"
     fi
 
     if command_exists rc-service; then sed -i "/^command_args=/c\\command_args=\"$CMD_ARGS\"" /etc/init.d/argo
@@ -390,7 +397,7 @@ EOF
 menu() {
     singbox_status=$(check_singbox 2>/dev/null); nginx_status=$(check_nginx 2>/dev/null); argo_status=$(check_argo 2>/dev/null)
     clear
-    purple "\n=== Argo + VMess + WS 管理脚本 (vm.sh) ===\n"
+    purple "\n=== Argo + VMess + WS 管理脚本 (纯v6适配版) ===\n"
     echo -e "Argo: ${argo_status} | Nginx: ${nginx_status} | Sing-box: ${singbox_status}\n"
     green "1. 安装"
     red "2. 卸载"
