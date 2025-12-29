@@ -1,8 +1,8 @@
 #!/bin/bash
-
 # =========================
-# Argo + VMess + WS 安装脚本
-# 基于老王sing-box脚本提取
+# Argo + VMess + WS 安装脚本 (修改版)
+# 1. 快捷指令改为 hu
+# 2. 修复固定隧道节点信息不更新问题
 # =========================
 
 export LANG=en_US.UTF-8
@@ -27,12 +27,21 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
+script_path="${work_dir}/manage.sh" # 定义脚本保存路径
+
 export vmess_port=${PORT:-8001}
 export CFIP=${CFIP:-'cf.877774.xyz'}
 export CFPORT=${CFPORT:-'443'}
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本" && exit 1
+
+# 自动保存当前脚本副本到工作目录，用于快捷指令调用
+if [ -f "$0" ]; then
+    mkdir -p "$work_dir"
+    cat "$0" > "$script_path"
+    chmod +x "$script_path"
+fi
 
 # 检查命令是否存在
 command_exists() {
@@ -57,11 +66,9 @@ check_service() {
 check_singbox() {
     check_service "sing-box" "${work_dir}/${server_name}"
 }
-
 check_argo() {
     check_service "argo" "${work_dir}/argo"
 }
-
 check_nginx() {
     command_exists nginx || { red "not installed"; return 2; }
     check_service "nginx" "$(command -v nginx)"
@@ -73,10 +80,8 @@ manage_packages() {
         red "Unspecified package name or action"
         return 1
     fi
-
     action=$1
     shift
-
     for package in "$@"; do
         if [ "$action" == "install" ]; then
             if command_exists "$package"; then
@@ -163,17 +168,14 @@ install_singbox() {
     curl -sLo "${work_dir}/argo" "https://$ARCH.ssss.nyc.mn/bot"
     
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
-
     # 生成UUID
     uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     
     # 生成nginx端口
     nginx_port=$(shuf -i 2000-65000 -n 1)
-
     # 检测网络类型并设置DNS策略
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
-
     # 生成配置文件
 cat > "${config_dir}" << EOF
 {
@@ -286,7 +288,6 @@ EOF
 alpine_openrc_services() {
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
-
 description="sing-box service"
 command="/etc/sing-box/sing-box"
 command_args="run -c /etc/sing-box/config.json"
@@ -296,7 +297,6 @@ EOF
 
     cat > /etc/init.d/argo << EOF
 #!/sbin/openrc-run
-
 description="Cloudflare Tunnel"
 command="/bin/sh"
 command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:$vmess_port --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
@@ -306,29 +306,50 @@ EOF
 
     chmod +x /etc/init.d/sing-box
     chmod +x /etc/init.d/argo
-
     rc-update add sing-box default > /dev/null 2>&1
     rc-update add argo default > /dev/null 2>&1
 }
 
-# 生成节点信息
+# 生成节点信息 (已修复: 支持读取固定隧道配置)
 get_info() {
-    yellow "\nip检测中,请稍等...\n"
-    server_ip=$(get_realip)
-    clear
-    isp=$(curl -s --max-time 2 https://ipapi.co/json | tr -d '\n[:space:]' | sed 's/.*"country_code":"\([^"]*\)".*"org":"\([^"]*\)".*/\1-\2/' | sed 's/ /_/g' 2>/dev/null || echo "$hostname")
+    # 尝试从配置文件恢复 UUID
+    if [ -z "$uuid" ] && [ -f "$config_dir" ]; then
+        if command_exists jq; then
+            uuid=$(jq -r '.inbounds[0].users[0].uuid' "$config_dir")
+        else
+            uuid=$(grep -o '"uuid": *"[^"]*"' "$config_dir" | head -1 | cut -d'"' -f4)
+        fi
+    fi
 
-    if [ -f "${work_dir}/argo.log" ]; then
-        for i in {1..5}; do
-            purple "第 $i 次尝试获取ArgoDoamin中..."
-            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
-            [ -n "$argodomain" ] && break
-            sleep 2
-        done
+    yellow "\n正在获取节点信息...\n"
+    server_ip=$(get_realip)
+    
+    isp=$(curl -s --max-time 2 https://ipapi.co/json | grep -o '"org":"[^"]*"' | cut -d'"' -f4 | sed 's/ /_/g' || echo "VPS")
+
+    # [修复] 优先检测是否有固定隧道配置 (tunnel.yml)
+    argodomain=""
+    if [ -f "${work_dir}/tunnel.yml" ]; then
+        argodomain=$(grep "hostname:" "${work_dir}/tunnel.yml" | head -1 | awk '{print $2}' | tr -d ' "')
+    fi
+
+    # 没找到固定域名再找日志
+    if [ -z "$argodomain" ]; then
+        if [ -f "${work_dir}/argo.log" ]; then
+             # 尝试多次读取
+            for i in {1..3}; do
+                argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | head -1)
+                [ -n "$argodomain" ] && break
+                sleep 1
+            done
+        fi
+        # 还没找到则重启
+        if [ -z "$argodomain" ]; then
+            restart_argo >/dev/null 2>&1
+            sleep 5
+            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | head -1)
+        fi
     else
-        restart_argo
-        sleep 6
-        argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+        green "\n检测到固定隧道配置，使用域名: ${argodomain}"
     fi
 
     green "\nArgoDomain：${purple}$argodomain${re}\n"
@@ -345,7 +366,7 @@ EOF
     base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
     chmod 644 ${work_dir}/sub.txt
     
-    yellow "\n温馨提醒：需打开V2rayN或其他软件里的 "跳过证书验证"，或将节点的Insecure或TLS里设置为"true"\n"
+    yellow "\n温馨提醒：需打开V2rayN或其他软件里的 \"跳过证书验证\"，或将节点的Insecure或TLS里设置为\"true\"\n"
     green "V2rayN,Shadowrocket,Nekobox,Loon,Karing,Sterisand订阅链接：http://${server_ip}:${nginx_port}/${password}\n"
     $work_dir/qrencode "http://${server_ip}:${nginx_port}/${password}"
     yellow "\n=========================================================================================="
@@ -366,21 +387,16 @@ add_nginx_conf() {
         manage_service "nginx" "stop" > /dev/null 2>&1
         pkill nginx > /dev/null 2>&1
     fi
-
     mkdir -p /etc/nginx/conf.d
-
     [[ -f "/etc/nginx/conf.d/sing-box.conf" ]] && cp /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/sing-box.conf.bak.sb
-
     cat > /etc/nginx/conf.d/sing-box.conf << EOF
 server {
     listen $nginx_port;
     listen [::]:$nginx_port;
     server_name _;
-
     add_header X-Frame-Options DENY;
     add_header X-Content-Type-Options nosniff;
     add_header X-XSS-Protection "1; mode=block";
-
     location = /$password {
         alias /etc/sing-box/sub.txt;
         default_type 'text/plain; charset=utf-8';
@@ -388,11 +404,9 @@ server {
         add_header Pragma "no-cache";
         add_header Expires "0";
     }
-
     location / {
         return 404;
     }
-
     location ~ /\. {
         deny all;
         access_log off;
@@ -400,7 +414,6 @@ server {
     }
 }
 EOF
-
     if [ -f "/etc/nginx/nginx.conf" ]; then
         cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak.sb > /dev/null 2>&1
         if ! grep -q "include.*conf.d" /etc/nginx/nginx.conf; then
@@ -415,11 +428,9 @@ user nginx;
 worker_processes auto;
 error_log /var/log/nginx/error.log;
 pid /run/nginx.pid;
-
 events {
     worker_connections 1024;
 }
-
 http {
     include       /etc/nginx/mime.types;
     default_type  application/octet-stream;
@@ -436,7 +447,6 @@ http {
 }
 EOF
     fi
-
     if nginx -t > /dev/null 2>&1; then
         if nginx -s reload > /dev/null 2>&1; then
             green "nginx订阅配置已加载"
@@ -453,12 +463,10 @@ EOF
 manage_service() {
     local service_name="$1"
     local action="$2"
-
     if [ -z "$service_name" ] || [ -z "$action" ]; then
         red "缺少服务名或操作参数\n"
         return 1
     fi
-
     case "$action" in
         "start"|"stop"|"restart")
             if command_exists rc-service; then
@@ -502,12 +510,14 @@ uninstall_singbox() {
             rm -rf /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
             rm -rf /etc/nginx/conf.d/sing-box.conf
             
+            # 删除快捷指令
+            rm -f /usr/bin/hu
+            
             reading "\n是否卸载 Nginx？(y/n): " choice
             case "${choice}" in
                 y|Y) manage_packages uninstall nginx ;;
                 *) yellow "取消卸载Nginx\n" ;;
             esac
-
             green "\n卸载成功\n" && exit 0
             ;;
         *)
@@ -516,15 +526,30 @@ uninstall_singbox() {
     esac
 }
 
-# 创建快捷指令
+# 创建快捷指令 (修改版：指向本地脚本)
 create_shortcut() {
-    cat > "$work_dir/vmess.sh" << 'EOF'
+    # 确保脚本文件存在
+    if [ ! -f "$script_path" ]; then
+         # 如果脚本是通过 pipe 运行的，这里可能为空，所以前面加了自动保存逻辑
+         yellow "正在保存脚本副本..."
+         # 这里假设用户是复制粘贴的，无法获取 $0，但前面已经处理了。
+         # 如果这里依然没有文件，只能报错
+         red "无法保存脚本副本，快捷指令可能无法正常工作。"
+    fi
+    
+    cat > "$work_dir/hu_runner.sh" << EOF
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/gaodashang167/vm-argo/main/vm.sh) $1
+if [ -f "$script_path" ]; then
+    bash "$script_path" \$1
+else
+    echo -e "\033[1;91m脚本文件 $script_path 不存在，请重新下载安装。\033[0m"
+fi
 EOF
-    chmod +x "$work_dir/vmess.sh"
-    ln -sf "$work_dir/vmess.sh" /usr/bin/vmess
-    [ -s /usr/bin/vmess ] && green "\n快捷指令 vmess 创建成功\n" || red "\n快捷指令创建失败\n"
+    chmod +x "$work_dir/hu_runner.sh"
+    
+    ln -sf "$work_dir/hu_runner.sh" /usr/bin/hu
+    
+    [ -s /usr/bin/hu ] && green "\n>>> 快捷指令 hu 创建成功！以后输入 hu 即可打开菜单 <<<\n" || red "\n快捷指令创建失败\n"
 }
 
 # Alpine适配
@@ -536,21 +561,14 @@ change_hosts() {
 
 # 查看节点信息
 check_nodes() {
-    purple "$(cat ${work_dir}/url.txt)"
-    server_ip=$(get_realip)
-    lujing=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
-    sub_port=$(sed -n 's/^\s*listen \([0-9]\+\);/\1/p' "/etc/nginx/conf.d/sing-box.conf")
-    base64_url="http://${server_ip}:${sub_port}/${lujing}"
-    
-    green "\n\nV2rayN等订阅链接: ${purple}${base64_url}${re}\n"
-    green "Clash订阅链接: ${purple}https://sublink.eooce.com/clash?config=${base64_url}${re}\n"
-    green "sing-box订阅链接: ${purple}https://sublink.eooce.com/singbox?config=${base64_url}${re}\n"
+    # 修复：复用 get_info 的逻辑以确保一致性
+    get_info
 }
 
-# Argo固定隧道配置
+# Argo固定隧道配置 (已修复: 自动生成伪造配置以供读取，并自动刷新)
 setup_argo_fixed() {
     clear
-    yellow "\n固定隧道可为json或token，固定隧道端口为${vmess_port}，请自行在cf后台设置\n"
+    yellow "\n固定隧道可为json或token，端口为${vmess_port}\n"
     yellow "json获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
     reading "\n请输入你的argo域名: " argo_domain
     reading "请输入你的argo密钥(token或json): " argo_auth
@@ -561,7 +579,6 @@ setup_argo_fixed() {
 tunnel: $(cut -d\" -f12 <<< "$argo_auth")
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
-
 ingress:
   - hostname: $argo_domain
     service: http://localhost:${vmess_port}
@@ -569,25 +586,34 @@ ingress:
       noTLSVerify: true
   - service: http_status:404
 EOF
-        if command_exists rc-service; then
-            sed -i '/^command_args=/c\command_args="-c '\''/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'\''"' /etc/init.d/argo
-        else
-            sed -i '/^ExecStart=/c\ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1"' /etc/systemd/system/argo.service
-        fi
-        restart_argo
-        green "\n固定隧道已配置,域名: $argo_domain\n"
+        CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'"
+
+    elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{100,}$ ]]; then
+        # [修复] Token模式也写入 hostname 到 yml 方便 get_info 读取
+        echo "hostname: $argo_domain" > "${work_dir}/tunnel.yml"
         
-    elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
-        if command_exists rc-service; then
-            sed -i "/^command_args=/c\command_args=\"-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'\"" /etc/init.d/argo
-        else
-            sed -i '/^ExecStart=/c\ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' 2>&1"' /etc/systemd/system/argo.service
-        fi
-        restart_argo
-        green "\n固定隧道已配置,域名: $argo_domain\n"
+        CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'"
     else
         red "输入的argo密钥格式不正确\n"
+        return 1
     fi
+
+    # 应用配置
+    if command_exists rc-service; then
+        sed -i "/^command_args=/c\\command_args=\"$CMD_ARGS\"" /etc/init.d/argo
+    else
+        # 转义双引号以免 sed 报错
+        ESCAPED_CMD=$(echo "$CMD_ARGS" | sed 's/"/\\"/g')
+        sed -i "/^ExecStart=/c\\ExecStart=/bin/sh -c \"${CMD_ARGS//\'/}\"" /etc/systemd/system/argo.service
+    fi
+
+    restart_argo
+    green "\n固定隧道已配置, 域名: $argo_domain"
+    
+    yellow "\n正在刷新节点信息..."
+    sleep 3
+    # [核心修复] 调用 get_info 立即显示新链接
+    get_info
 }
 
 # 主菜单
@@ -598,7 +624,7 @@ menu() {
     
     clear
     echo ""
-    purple "=== Argo + VMess + WS 安装脚本 ===\n"
+    purple "=== Argo + VMess + WS 安装脚本 (Hu修正版) ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
     purple "singbox 状态: ${singbox_status}\n"
@@ -623,6 +649,7 @@ while true; do
             check_singbox &>/dev/null; check_singbox=$?
             if [ ${check_singbox} -eq 0 ]; then
                 yellow "已经安装！\n"
+                create_shortcut # 确保快捷指令存在
             else
                 manage_packages install nginx jq tar openssl lsof coreutils
                 install_singbox
@@ -635,7 +662,6 @@ while true; do
                     rc-service sing-box restart
                     rc-service argo restart
                 fi
-
                 sleep 5
                 get_info
                 add_nginx_conf
