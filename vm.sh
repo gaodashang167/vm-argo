@@ -44,12 +44,12 @@ check_service() {
     local service_name=$1
     local service_file=$2
     
-    [[ ! -f "${service_file}" ]] && { echo "not installed"; return 2; }
+    [[ ! -f "${service_file}" ]] && { red "not installed"; return 2; }
         
     if command_exists apk; then
-        rc-service "${service_name}" status | grep -q "started" && echo "running" || echo "not running"
+        rc-service "${service_name}" status | grep -q "started" && green "running" || yellow "not running"
     else
-        systemctl is-active "${service_name}" | grep -q "^active$" && echo "running" || echo "not running"
+        systemctl is-active "${service_name}" | grep -q "^active$" && green "running" || yellow "not running"
     fi
     return $?
 }
@@ -63,7 +63,7 @@ check_argo() {
 }
 
 check_nginx() {
-    command_exists nginx || { echo "not installed"; return 2; }
+    command_exists nginx || { red "not installed"; return 2; }
     check_service "nginx" "$(command -v nginx)"
 }
 
@@ -164,7 +164,7 @@ install_singbox() {
     
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
-    # 生成UUID和密码
+    # 生成UUID
     uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     
@@ -316,7 +316,7 @@ get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
     clear
-    isp=$(curl -s --max-time 2 https://ipapi.co/json | tr -d '\n[:space:]' | sed 's/.*"country_code":"\([^"]*\)".*"org":"\([^"]*\)".*/\1-\2/' | sed 's/ /_/g' 2>/dev/null || echo "VPS")
+    isp=$(curl -s --max-time 2 https://ipapi.co/json | tr -d '\n[:space:]' | sed 's/.*"country_code":"\([^"]*\)".*"org":"\([^"]*\)".*/\1-\2/' | sed 's/ /_/g' 2>/dev/null || echo "$hostname")
 
     if [ -f "${work_dir}/argo.log" ]; then
         for i in {1..5}; do
@@ -464,7 +464,7 @@ manage_service() {
             if command_exists rc-service; then
                 rc-service "$service_name" "$action"
             elif command_exists systemctl; then
-                [ "$action" == "restart" ] && systemctl daemon-reload
+                systemctl daemon-reload
                 systemctl "$action" "$service_name"
             fi
             ;;
@@ -536,216 +536,58 @@ change_hosts() {
 
 # 查看节点信息
 check_nodes() {
-    if [ ! -f "${work_dir}/url.txt" ]; then
-        yellow "节点信息文件不存在，请先安装\n"
-        return 1
-    fi
-    
     purple "$(cat ${work_dir}/url.txt)"
     server_ip=$(get_realip)
-    lujing=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf" 2>/dev/null)
-    sub_port=$(sed -n 's/^\s*listen \([0-9]\+\);/\1/p' "/etc/nginx/conf.d/sing-box.conf" 2>/dev/null)
+    lujing=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
+    sub_port=$(sed -n 's/^\s*listen \([0-9]\+\);/\1/p' "/etc/nginx/conf.d/sing-box.conf")
+    base64_url="http://${server_ip}:${sub_port}/${lujing}"
     
-    if [ -n "$lujing" ] && [ -n "$sub_port" ]; then
-        base64_url="http://${server_ip}:${sub_port}/${lujing}"
-        green "\n\nV2rayN等订阅链接: ${purple}${base64_url}${re}\n"
-        green "Clash订阅链接: ${purple}https://sublink.eooce.com/clash?config=${base64_url}${re}\n"
-        green "sing-box订阅链接: ${purple}https://sublink.eooce.com/singbox?config=${base64_url}${re}\n"
-    else
-        yellow "\n订阅服务未配置\n"
-    fi
+    green "\n\nV2rayN等订阅链接: ${purple}${base64_url}${re}\n"
+    green "Clash订阅链接: ${purple}https://sublink.eooce.com/clash?config=${base64_url}${re}\n"
+    green "sing-box订阅链接: ${purple}https://sublink.eooce.com/singbox?config=${base64_url}${re}\n"
 }
 
-# 获取argo临时隧道
-get_quick_tunnel() {
-    restart_argo
-    yellow "获取临时argo域名中，请稍等...\n"
-    sleep 3
-    if [ -f /etc/sing-box/argo.log ]; then
-        for i in {1..5}; do
-            purple "第 $i 次尝试获取ArgoDoamin中..."
-            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "/etc/sing-box/argo.log")
-            [ -n "$get_argodomain" ] && break
-            sleep 2
-        done
-    else
-        restart_argo
-        sleep 6
-        get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "/etc/sing-box/argo.log")
-    fi
-    green "ArgoDomain：${purple}$get_argodomain${re}\n"
-    ArgoDomain=$get_argodomain
-}
-
-# 更新Argo域名到订阅
-change_argo_domain() {
-    if [ ! -f "$client_dir" ]; then
-        red "节点配置文件不存在\n"
-        return 1
-    fi
-    
-    content=$(cat "$client_dir")
-    vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
-    
-    if [ -z "$vmess_url" ]; then
-        red "未找到vmess节点信息\n"
-        return 1
-    fi
-    
-    vmess_prefix="vmess://"
-    encoded_vmess="${vmess_url#"$vmess_prefix"}"
-    decoded_vmess=$(echo "$encoded_vmess" | base64 --decode 2>/dev/null)
-    
-    if [ -z "$decoded_vmess" ]; then
-        red "vmess节点解码失败\n"
-        return 1
-    fi
-    
-    updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain')
-    encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-    new_vmess_url="${vmess_prefix}${encoded_updated_vmess}"
-    new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-    echo "$new_content" > "$client_dir"
-    base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
-    green "vmess节点已更新,请更新订阅或手动复制以下vmess-argo节点\n"
-    purple "$new_vmess_url\n" 
-}
-
-# Argo 管理菜单
-manage_argo() {
-    local argo_status=$(check_argo 2>/dev/null)
-
+# Argo固定隧道配置
+setup_argo_fixed() {
     clear
-    echo ""
-    green "=== Argo 隧道管理 ===\n"
-    green "Argo当前状态: $argo_status\n"
-    green "1. 启动Argo服务"
-    skyblue "------------"
-    green "2. 停止Argo服务"
-    skyblue "------------"
-    green "3. 重启Argo服务"
-    skyblue "------------"
-    green "4. 添加Argo固定隧道"
-    skyblue "----------------"
-    green "5. 切换回Argo临时隧道"
-    skyblue "------------------"
-    green "6. 重新获取Argo临时域名"
-    skyblue "-------------------"
-    purple "0. 返回主菜单"
-    skyblue "-----------"
-    reading "\n请输入选择: " argo_choice
-    case "${argo_choice}" in
-        1)  
-            start_argo 
-            read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
-            manage_argo
-            ;;
-        2)  
-            stop_argo
-            read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
-            manage_argo
-            ;; 
-        3)  
-            clear
-            if command_exists rc-service 2>/dev/null; then
-                grep -Fq -- '--url http://localhost' /etc/init.d/argo && get_quick_tunnel && change_argo_domain || { green "\n当前使用固定隧道,无需获取临时域名\n"; sleep 2; }
-            else
-                grep -q 'ExecStart=.*--url http://localhost' /etc/systemd/system/argo.service && get_quick_tunnel && change_argo_domain || { green "\n当前使用固定隧道,无需获取临时域名\n"; sleep 2; }
-            fi
-            read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
-            manage_argo
-            ;; 
-        4)
-            clear
-            yellow "\n固定隧道可为json或token，固定隧道端口为${vmess_port}，请自行在cf后台设置\n\njson在f佬维护的站点里获取，获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
-            reading "\n请输入你的argo域名: " argo_domain
-            ArgoDomain=$argo_domain
-            reading "\n请输入你的argo密钥(token或json): " argo_auth
-            
-            if [[ $argo_auth =~ TunnelSecret ]]; then
-                echo $argo_auth > ${work_dir}/tunnel.json
-                cat > ${work_dir}/tunnel.yml << EOF
+    yellow "\n固定隧道可为json或token，固定隧道端口为${vmess_port}，请自行在cf后台设置\n"
+    yellow "json获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
+    reading "\n请输入你的argo域名: " argo_domain
+    reading "请输入你的argo密钥(token或json): " argo_auth
+    
+    if [[ $argo_auth =~ TunnelSecret ]]; then
+        echo $argo_auth > ${work_dir}/tunnel.json
+        cat > ${work_dir}/tunnel.yml << EOF
 tunnel: $(cut -d\" -f12 <<< "$argo_auth")
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
-                                           
+
 ingress:
-  - hostname: $ArgoDomain
+  - hostname: $argo_domain
     service: http://localhost:${vmess_port}
     originRequest:
       noTLSVerify: true
   - service: http_status:404
 EOF
-
-                if command_exists rc-service 2>/dev/null; then
-                    sed -i '/^command_args=/c\command_args="-c '\''/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'\''"' /etc/init.d/argo
-                else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1"' /etc/systemd/system/argo.service
-                fi
-                restart_argo
-                sleep 1 
-                change_argo_domain
-
-            elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
-                if command_exists rc-service 2>/dev/null; then
-                    sed -i "/^command_args=/c\command_args=\"-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'\"" /etc/init.d/argo
-                else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' 2>&1"' /etc/systemd/system/argo.service
-                fi
-                restart_argo
-                sleep 1 
-                change_argo_domain
-            else
-                yellow "你输入的argo域名或token不匹配，请重新输入\n"
-                sleep 2
-            fi
-            read -n 1 -s -r -p \033[1;91m按任意键返回...\033[0m'
-            manage_argo
-            ;; 
-        5)
-            clear
-            yellow "正在切换回临时隧道...\n"
-            if command_exists rc-service 2>/dev/null; then
-                alpine_openrc_services
-            else
-                main_systemd_services
-            fi
-            get_quick_tunnel
-            change_argo_domain
-            read -n 1 -s -r -p \033[1;91m按任意键返回...\033[0m'
-            manage_argo
-            ;; 
-
-        6)  
-            if command_exists rc-service 2>/dev/null; then
-                if grep -Fq -- '--url http://localhost' "/etc/init.d/argo"; then
-                    get_quick_tunnel
-                    change_argo_domain 
-                else
-                    yellow "当前使用固定隧道，无法获取临时隧道\n"
-                    sleep 2
-                fi
-            else
-                if grep -q 'ExecStart=.*--url http://localhost' "/etc/systemd/system/argo.service"; then
-                    get_quick_tunnel
-                    change_argo_domain 
-                else
-                    yellow "当前使用固定隧道，无法获取临时隧道\n"
-                    sleep 2
-                fi
-            fi
-            read -n 1 -s -r -p \033[1;91m按任意键返回...\033[0m'
-            manage_argo
-            ;; 
-        0)  
-            return
-            ;; 
-        *)  
-            red "无效的选项！\n"
-            sleep 1
-            manage_argo
-            ;;
-    esac
+        if command_exists rc-service; then
+            sed -i '/^command_args=/c\command_args="-c '\''/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'\''"' /etc/init.d/argo
+        else
+            sed -i '/^ExecStart=/c\ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1"' /etc/systemd/system/argo.service
+        fi
+        restart_argo
+        green "\n固定隧道已配置,域名: $argo_domain\n"
+        
+    elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
+        if command_exists rc-service; then
+            sed -i "/^command_args=/c\command_args=\"-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'\"" /etc/init.d/argo
+        else
+            sed -i '/^ExecStart=/c\ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' 2>&1"' /etc/systemd/system/argo.service
+        fi
+        restart_argo
+        green "\n固定隧道已配置,域名: $argo_domain\n"
+    else
+        red "输入的argo密钥格式不正确\n"
+    fi
 }
 
 # 主菜单
@@ -756,23 +598,20 @@ menu() {
     
     clear
     echo ""
-    green "Telegram群组: ${purple}https://t.me/eooceu${re}"
-    green "YouTube频道: ${purple}https://youtube.com/@eooce${re}\n"
     purple "=== Argo + VMess + WS 安装脚本 ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
     purple "singbox 状态: ${singbox_status}\n"
-    green "1. 安装服务"
-    red "2. 卸载服务"
-    skyblue "============"
-    green "3. Argo隧道管理"
-    skyblue "============"
-    green "4. 查看节点信息"
-    green "5. 重启所有服务"
-    skyblue "============"
-    red "0. 退出脚本"
+    green "1. 安装"
+    red "2. 卸载"
+    skyblue "==========="
+    green "3. 查看节点信息"
+    green "4. 配置Argo固定隧道"
+    green "5. 重启服务"
+    skyblue "==========="
+    red "0. 退出"
     echo "==========="
-    reading "请输入选择(0-5): " choice
+    reading "请输入选择: " choice
     echo ""
 }
 
@@ -781,10 +620,9 @@ while true; do
     menu
     case "${choice}" in
         1)
-            check_singbox &>/dev/null
-            result=$?
-            if [ ${result} -eq 0 ]; then
-                yellow "服务已经安装！\n"
+            check_singbox &>/dev/null; check_singbox=$?
+            if [ ${check_singbox} -eq 0 ]; then
+                yellow "已经安装！\n"
             else
                 manage_packages install nginx jq tar openssl lsof coreutils
                 install_singbox
@@ -804,27 +642,12 @@ while true; do
                 create_shortcut
             fi
             ;;
-        2) 
-            uninstall_singbox
-            ;;
-        3) 
-            manage_argo
-            ;;
-        4) 
-            check_nodes
-            ;;
-        5) 
-            restart_singbox
-            restart_argo
-            restart_nginx
-            green "\n所有服务已重启\n"
-            ;;
-        0) 
-            exit 0
-            ;;
-        *) 
-            red "无效的选项，请输入 0-5\n"
-            ;;
+        2) uninstall_singbox ;;
+        3) check_nodes ;;
+        4) setup_argo_fixed ;;
+        5) restart_singbox && restart_argo && restart_nginx && green "服务已重启\n" ;;
+        0) exit 0 ;;
+        *) red "无效的选项" ;;
     esac
-    read -n 1 -s -r -p \033[1;91m按任意键返回...\033[0m'
+    read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
 done
