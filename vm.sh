@@ -1,9 +1,7 @@
 #!/bin/bash
 # =========================
-# Argo + VMess + WS 安装脚本 (v6 完美适配版)
-# 1. 隧道协议更换为 QUIC (解决 v6 连不上/不绿的问题)
-# 2. 自动检测 IPv6 环境并应用优化参数
-# 3. 修复固定隧道刷新和显示逻辑
+# Argo + VMess + WS 安装脚本 (v6 终极融合修正版)
+# 参考老王脚本逻辑，重点修复 v6 回源问题
 # =========================
 
 export LANG=en_US.UTF-8
@@ -28,7 +26,6 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
-# 请确保这里是你的真实 GitHub 地址
 GITHUB_URL="https://raw.githubusercontent.com/gaodashang167/vm-argo/main/vm.sh"
 LOCAL_SCRIPT="${work_dir}/vm.sh"
 
@@ -39,17 +36,15 @@ export CFPORT=${CFPORT:-'443'}
 # 检查Root
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本" && exit 1
 
-# === 核心修复：智能网络环境检测 ===
-check_network_env() {
-    # 尝试连接 v4 地址，超时则认为只有 v6
-    if curl -4 -s --connect-timeout 2 https://1.1.1.1 >/dev/null 2>&1; then
-        echo "auto"
+# === 网络环境检测 ===
+check_ipv6_only() {
+    # 如果 ping 不通 v4 地址，认为是纯 v6
+    if ! ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1; then
+        return 0 # True, IPv6 Only
     else
-        echo "6"
+        return 1 # False, Has IPv4
     fi
 }
-# 获取环境参数
-ARGO_EDGE_IP=$(check_network_env)
 
 # 基础检查函数
 command_exists() { command -v "$1" >/dev/null 2>&1; }
@@ -91,10 +86,7 @@ get_realip() {
     ip=$(curl -4 -sm 2 ip.sb)
     ipv6() { curl -6 -sm 2 ip.sb; }
     if [ -z "$ip" ]; then echo "[$(ipv6)]"
-    else
-        resp=$(curl -sm 2 "https://status.eooce.com/api/$ip" | jq -r '.status' 2>/dev/null)
-        if [ "$resp" = "Available" ]; then echo "$ip"; else v6=$(ipv6); [ -n "$v6" ] && echo "[$v6]" || echo "$ip"; fi
-    fi
+    else echo "$ip"; fi
 }
 
 # 安装Sing-box
@@ -119,7 +111,7 @@ install_singbox() {
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     nginx_port=$(shuf -i 2000-65000 -n 1)
     
-    # 智能DNS: 纯v6环境优先使用Google v6 DNS
+    # DNS策略
     dns_strategy=$(ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || echo "prefer_ipv6")
 
 cat > "${config_dir}" << EOF
@@ -133,8 +125,11 @@ cat > "${config_dir}" << EOF
 EOF
 }
 
-# Systemd服务 (已修改为 QUIC 协议)
+# Systemd服务
 main_systemd_services() {
+    # 确定 Argo 回源地址：纯v6用 [::1]，否则用 localhost
+    if check_ipv6_only; then ORIGIN_URL="http://[::1]:$vmess_port"; else ORIGIN_URL="http://localhost:$vmess_port"; fi
+
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
 Description=sing-box
@@ -150,7 +145,6 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF
 
-    # 关键修改：--protocol quic
     cat > /etc/systemd/system/argo.service << EOF
 [Unit]
 Description=Cloudflare Tunnel
@@ -158,7 +152,7 @@ After=network.target
 [Service]
 Type=simple
 NoNewPrivileges=yes
-ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://localhost:$vmess_port --no-autoupdate --edge-ip-version $ARGO_EDGE_IP --protocol quic > /etc/sing-box/argo.log 2>&1"
+ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url $ORIGIN_URL --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
 Restart=on-failure
 RestartSec=5s
 [Install]
@@ -173,8 +167,10 @@ EOF
     systemctl start sing-box argo
 }
 
-# OpenRC服务 (已修改为 QUIC 协议)
+# OpenRC服务
 alpine_openrc_services() {
+    if check_ipv6_only; then ORIGIN_URL="http://[::1]:$vmess_port"; else ORIGIN_URL="http://localhost:$vmess_port"; fi
+
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
 description="sing-box"
@@ -187,7 +183,7 @@ EOF
 #!/sbin/openrc-run
 description="Cloudflare Tunnel"
 command="/bin/sh"
-command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:$vmess_port --no-autoupdate --edge-ip-version $ARGO_EDGE_IP --protocol quic > /etc/sing-box/argo.log 2>&1'"
+command_args="-c '/etc/sing-box/argo tunnel --url $ORIGIN_URL --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
 command_background=true
 pidfile="/var/run/argo.pid"
 EOF
@@ -210,22 +206,21 @@ get_info() {
     [ -f "${work_dir}/tunnel.yml" ] && argodomain=$(grep "hostname:" "${work_dir}/tunnel.yml" | head -1 | awk '{print $2}' | tr -d ' "')
 
     if [ -z "$argodomain" ]; then
-        # 尝试读取日志
         for i in {1..3}; do
             argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | head -1)
             [ -n "$argodomain" ] && break
             sleep 1
         done
         if [ -z "$argodomain" ]; then
-            purple "临时域名生成较慢，尝试重启..."
+            purple "临时域名获取中..."
             restart_argo >/dev/null 2>&1 && sleep 5
             argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | head -1)
         fi
     else
-        green "\n检测到固定隧道配置: ${argodomain}"
+        green "\n检测到固定隧道: ${argodomain}"
     fi
     
-    [ -z "$argodomain" ] && red "获取 Argo 域名失败。如果是固定隧道，请检查 Cloudflare 后台状态。" && return
+    [ -z "$argodomain" ] && red "获取域名失败，请检查服务。" && return
 
     green "\nArgo域名：${purple}$argodomain${re}\n"
     VMESS="{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowlnsecure\": \"false\"}"
@@ -235,12 +230,6 @@ get_info() {
     purple "$(cat ${work_dir}/url.txt)"
     base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt && chmod 644 ${work_dir}/sub.txt
     
-    yellow "\n=========================================================="
-    yellow " 重要提示：如果固定隧道已连接但无法上网："
-    yellow " 请在 Cloudflare 后台 -> Access -> Tunnels -> Configure -> Public Hostname"
-    yellow " 将 Service 设置为: ${green}http://localhost:${vmess_port}${yellow}"
-    yellow " 如果 localhost 不行，请尝试: ${green}http://127.0.0.1:${vmess_port}${yellow} 或 ${green}http://[::1]:${vmess_port}${yellow}"
-    yellow "=========================================================="
     green "\n订阅链接：http://${server_ip}:${nginx_port}/${password}\n"
 }
 
@@ -303,13 +292,12 @@ create_shortcut() {
     cat > "/usr/bin/hu" << EOF
 #!/bin/bash
 if [ -s "$LOCAL_SCRIPT" ]; then bash "$LOCAL_SCRIPT" \$1; else
-    echo -e "\033[1;33m尝试重新下载脚本...\033[0m"
     mkdir -p "$work_dir" && curl -sLo "$LOCAL_SCRIPT" "$GITHUB_URL" && chmod +x "$LOCAL_SCRIPT"
     [ -s "$LOCAL_SCRIPT" ] && bash "$LOCAL_SCRIPT" \$1 || echo "下载失败"
 fi
 EOF
     chmod +x "/usr/bin/hu"
-    green "\n>>> hu 命令已配置 (v6 QUIC版) <<<\n"
+    green "\n>>> hu 命令已配置 <<<\n"
 }
 
 # Alpine host
@@ -319,7 +307,7 @@ change_hosts() {
     sed -i '2s/.*/::1         localhost/' /etc/hosts
 }
 
-# 配置固定隧道
+# 配置固定隧道 (核心修复部分)
 setup_argo_fixed() {
     clear
     yellow "\n固定隧道配置 (端口:${vmess_port})\n"
@@ -328,28 +316,43 @@ setup_argo_fixed() {
     [ -z "$argo_domain" ] || [ -z "$argo_auth" ] && red "不能为空" && return
     stop_argo >/dev/null 2>&1
     
-    # 强制使用 QUIC 协议
-    EDGE_ARG="--edge-ip-version $ARGO_EDGE_IP"
-    
+    # === 关键修复：纯 IPv6 强制回源到 [::1] ===
+    if check_ipv6_only; then
+        ORIGIN_SERVICE="http://[::1]:${vmess_port}"
+    else
+        ORIGIN_SERVICE="http://localhost:${vmess_port}"
+    fi
+
     if [[ $argo_auth =~ TunnelSecret ]]; then
         echo "$argo_auth" > "${work_dir}/tunnel.json"
         TUNNEL_ID=$(cut -d\" -f12 <<< "$argo_auth")
         cat > "${work_dir}/tunnel.yml" << EOF
 tunnel: $TUNNEL_ID
 credentials-file: ${work_dir}/tunnel.json
-protocol: quic
+protocol: http2
 ingress:
   - hostname: $argo_domain
-    service: http://localhost:${vmess_port}
-    originRequest: { noTLSVerify: true }
+    service: $ORIGIN_SERVICE
+    originRequest:
+      noTLSVerify: true
   - service: http_status:404
 EOF
-        CMD_ARGS="-c '/etc/sing-box/argo tunnel $EDGE_ARG --config /etc/sing-box/tunnel.yml run 2>&1'"
+        CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'"
     else
         # Token模式：写入Hostname供脚本读取
         echo "hostname: $argo_domain" > "${work_dir}/tunnel.yml"
-        # 关键修改：--protocol quic
-        CMD_ARGS="-c '/etc/sing-box/argo tunnel $EDGE_ARG --no-autoupdate --protocol quic run --token $argo_auth 2>&1'"
+        
+        # ⚠️ 注意：Token模式下，Argo不会读取 tunnel.yml 中的 ingress 规则
+        # 因此，必须提示用户在 Cloudflare 后台修改 Service 地址
+        yellow "\n======================================================="
+        yellow "⚠️ 警告：使用 Token 模式 (IPv6环境)"
+        yellow "脚本无法自动修改云端回源地址。"
+        yellow "请务必登录 Cloudflare 后台 -> Tunnels -> Configure -> Public Hostname"
+        yellow "将 Service URL 修改为: ${green}${ORIGIN_SERVICE}${yellow}"
+        yellow "=======================================================\n"
+        reading "确认已在后台修改完成？(按回车继续)" confirm
+        
+        CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'"
     fi
 
     if command_exists rc-service; then sed -i "/^command_args=/c\\command_args=\"$CMD_ARGS\"" /etc/init.d/argo
@@ -363,12 +366,12 @@ EOF
 menu() {
     singbox_status=$(check_singbox 2>/dev/null); nginx_status=$(check_nginx 2>/dev/null); argo_status=$(check_argo 2>/dev/null)
     clear
-    purple "\n=== Argo + VMess + WS (纯v6/QUIC修复版) ===\n"
+    purple "\n=== Argo + VMess + WS (v6融合版) ===\n"
     echo -e "Argo: ${argo_status} | Nginx: ${nginx_status} | Sing-box: ${singbox_status}\n"
     green "1. 安装"
     red "2. 卸载"
     green "3. 查看节点"
-    green "4. 配置固定隧道 (推荐)"
+    green "4. 配置固定隧道"
     green "5. 重启服务"
     red "0. 退出"
     reading "\n请选择: " choice
