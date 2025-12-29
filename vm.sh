@@ -1,7 +1,9 @@
 #!/bin/bash
 # =========================
-# Argo + VMess + WS 安装脚本 (v6 终极融合修正版)
-# 参考老王脚本逻辑，重点修复 v6 回源问题
+# Argo + VMess + WS 安装脚本 (复刻老王核心逻辑版)
+# 1. 全局强制修复 /etc/hosts (解决 v6 localhost 解析问题)
+# 2. 严格区分 Token/JSON 启动方式
+# 3. 修复 hu 命令和节点显示
 # =========================
 
 export LANG=en_US.UTF-8
@@ -21,11 +23,12 @@ purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue() { echo -e "\e[1;36m$1\033[0m"; }
 reading() { read -p "$(red "$1")" "$2"; }
 
-# 常量定义
+# 常量
 server_name="sing-box"
 work_dir="/etc/sing-box"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
+domain_file="${work_dir}/fixed_domain.txt" # 单独记录固定域名
 GITHUB_URL="https://raw.githubusercontent.com/gaodashang167/vm-argo/main/vm.sh"
 LOCAL_SCRIPT="${work_dir}/vm.sh"
 
@@ -33,20 +36,24 @@ export vmess_port=${PORT:-8001}
 export CFIP=${CFIP:-'cf.877774.xyz'}
 export CFPORT=${CFPORT:-'443'}
 
-# 检查Root
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本" && exit 1
 
-# === 网络环境检测 ===
-check_ipv6_only() {
-    # 如果 ping 不通 v4 地址，认为是纯 v6
-    if ! ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1; then
-        return 0 # True, IPv6 Only
-    else
-        return 1 # False, Has IPv4
+# === 关键函数：强制修复 Hosts (参考老王脚本) ===
+fix_hosts() {
+    # 无论什么系统，确保 localhost 同时解析到 v4 和 v6 回环
+    if [ -f /etc/hosts ]; then
+        # 备份一下
+        cp /etc/hosts /etc/hosts.bak 2>/dev/null
+        # 确保第一行是 127.0.0.1，第二行是 ::1
+        sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
+        sed -i '2s/.*/::1         localhost/' /etc/hosts
+        # 有些系统需要这个参数
+        if [ -f /proc/sys/net/ipv4/ping_group_range ]; then
+            echo "0 0" > /proc/sys/net/ipv4/ping_group_range
+        fi
     fi
 }
 
-# 基础检查函数
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 check_service() {
     local n=$1; local f=$2
@@ -58,7 +65,6 @@ check_singbox() { check_service "sing-box" "${work_dir}/${server_name}"; }
 check_argo() { check_service "argo" "${work_dir}/argo"; }
 check_nginx() { command_exists nginx || { red "not installed"; return 2; }; check_service "nginx" "$(command -v nginx)"; }
 
-# 包管理
 manage_packages() {
     if [ $# -lt 2 ]; then return 1; fi
     action=$1; shift
@@ -81,7 +87,6 @@ manage_packages() {
     done
 }
 
-# 获取IP
 get_realip() {
     ip=$(curl -4 -sm 2 ip.sb)
     ipv6() { curl -6 -sm 2 ip.sb; }
@@ -89,10 +94,11 @@ get_realip() {
     else echo "$ip"; fi
 }
 
-# 安装Sing-box
 install_singbox() {
     clear
     purple "正在安装sing-box..."
+    fix_hosts # 安装时执行 Hosts 修复
+
     ARCH_RAW=$(uname -m)
     case "${ARCH_RAW}" in
         'x86_64') ARCH='amd64' ;;
@@ -111,7 +117,6 @@ install_singbox() {
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     nginx_port=$(shuf -i 2000-65000 -n 1)
     
-    # DNS策略
     dns_strategy=$(ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || echo "prefer_ipv6")
 
 cat > "${config_dir}" << EOF
@@ -125,11 +130,7 @@ cat > "${config_dir}" << EOF
 EOF
 }
 
-# Systemd服务
 main_systemd_services() {
-    # 确定 Argo 回源地址：纯v6用 [::1]，否则用 localhost
-    if check_ipv6_only; then ORIGIN_URL="http://[::1]:$vmess_port"; else ORIGIN_URL="http://localhost:$vmess_port"; fi
-
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
 Description=sing-box
@@ -145,6 +146,7 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF
 
+    # 默认临时隧道配置
     cat > /etc/systemd/system/argo.service << EOF
 [Unit]
 Description=Cloudflare Tunnel
@@ -152,7 +154,7 @@ After=network.target
 [Service]
 Type=simple
 NoNewPrivileges=yes
-ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url $ORIGIN_URL --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
+ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://localhost:$vmess_port --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
 Restart=on-failure
 RestartSec=5s
 [Install]
@@ -167,10 +169,7 @@ EOF
     systemctl start sing-box argo
 }
 
-# OpenRC服务
 alpine_openrc_services() {
-    if check_ipv6_only; then ORIGIN_URL="http://[::1]:$vmess_port"; else ORIGIN_URL="http://localhost:$vmess_port"; fi
-
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
 description="sing-box"
@@ -183,7 +182,7 @@ EOF
 #!/sbin/openrc-run
 description="Cloudflare Tunnel"
 command="/bin/sh"
-command_args="-c '/etc/sing-box/argo tunnel --url $ORIGIN_URL --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
+command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:$vmess_port --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
 command_background=true
 pidfile="/var/run/argo.pid"
 EOF
@@ -192,9 +191,7 @@ EOF
     rc-update add argo default > /dev/null 2>&1
 }
 
-# 获取信息
 get_info() {
-    # 恢复 UUID
     if [ -z "$uuid" ] && [ -f "$config_dir" ]; then
         command_exists jq && uuid=$(jq -r '.inbounds[0].users[0].uuid' "$config_dir") || uuid=$(grep -o '"uuid": *"[^"]*"' "$config_dir" | head -1 | cut -d'"' -f4)
     fi
@@ -203,8 +200,16 @@ get_info() {
     isp=$(curl -s --max-time 2 https://ipapi.co/json | grep -o '"org":"[^"]*"' | cut -d'"' -f4 | sed 's/ /_/g' || echo "VPS")
     
     argodomain=""
-    [ -f "${work_dir}/tunnel.yml" ] && argodomain=$(grep "hostname:" "${work_dir}/tunnel.yml" | head -1 | awk '{print $2}' | tr -d ' "')
+    
+    # 1. 优先读取固定域名文件 (Token模式)
+    if [ -f "$domain_file" ]; then
+        argodomain=$(cat "$domain_file")
+    # 2. 其次读取 yml (JSON模式)
+    elif [ -f "${work_dir}/tunnel.yml" ]; then
+        argodomain=$(grep "hostname:" "${work_dir}/tunnel.yml" | head -1 | awk '{print $2}' | tr -d ' "')
+    fi
 
+    # 3. 最后才找日志 (临时模式)
     if [ -z "$argodomain" ]; then
         for i in {1..3}; do
             argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | head -1)
@@ -233,7 +238,6 @@ get_info() {
     green "\n订阅链接：http://${server_ip}:${nginx_port}/${password}\n"
 }
 
-# Nginx配置
 add_nginx_conf() {
     if ! command_exists nginx; then return 1; else manage_service "nginx" "stop" >/dev/null 2>&1; fi
     mkdir -p /etc/nginx/conf.d
@@ -253,7 +257,6 @@ EOF
     nginx -t >/dev/null 2>&1 && start_nginx || restart_nginx
 }
 
-# 服务管理
 manage_service() { local n=$1; local a=$2; command_exists rc-service && rc-service "$n" "$a" || systemctl "$a" "$n"; }
 start_singbox() { manage_service "sing-box" "start"; }
 stop_singbox() { manage_service "sing-box" "stop"; }
@@ -264,7 +267,6 @@ restart_argo() { manage_service "argo" "restart"; }
 start_nginx() { manage_service "nginx" "start"; }
 restart_nginx() { manage_service "nginx" "restart"; }
 
-# 卸载
 uninstall_singbox() {
     reading "确定卸载? (y/n): " choice
     [[ "$choice" != "y" && "$choice" != "Y" ]] && return
@@ -284,7 +286,6 @@ uninstall_singbox() {
     green "卸载完成" && exit 0
 }
 
-# 快捷指令
 create_shortcut() {
     yellow "\n配置快捷指令 hu..."
     curl -sLo "$LOCAL_SCRIPT" "$GITHUB_URL"
@@ -300,14 +301,7 @@ EOF
     green "\n>>> hu 命令已配置 <<<\n"
 }
 
-# Alpine host
-change_hosts() {
-    sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
-    sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
-    sed -i '2s/.*/::1         localhost/' /etc/hosts
-}
-
-# 配置固定隧道 (核心修复部分)
+# 核心修复部分：固定隧道
 setup_argo_fixed() {
     clear
     yellow "\n固定隧道配置 (端口:${vmess_port})\n"
@@ -316,57 +310,59 @@ setup_argo_fixed() {
     [ -z "$argo_domain" ] || [ -z "$argo_auth" ] && red "不能为空" && return
     stop_argo >/dev/null 2>&1
     
-    # === 关键修复：纯 IPv6 强制回源到 [::1] ===
-    if check_ipv6_only; then
-        ORIGIN_SERVICE="http://[::1]:${vmess_port}"
-    else
-        ORIGIN_SERVICE="http://localhost:${vmess_port}"
-    fi
+    # 记录域名到文件，供 get_info 使用 (替代 tunnel.yml 在 Token 模式下的作用)
+    echo "$argo_domain" > "$domain_file"
+
+    # 执行一次 hosts 修复，确保万无一失
+    fix_hosts
 
     if [[ $argo_auth =~ TunnelSecret ]]; then
+        # === JSON 模式 ===
         echo "$argo_auth" > "${work_dir}/tunnel.json"
         TUNNEL_ID=$(cut -d\" -f12 <<< "$argo_auth")
+        
+        # 老王同款配置，显式指定 ingress
         cat > "${work_dir}/tunnel.yml" << EOF
 tunnel: $TUNNEL_ID
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
 ingress:
   - hostname: $argo_domain
-    service: $ORIGIN_SERVICE
+    service: http://localhost:${vmess_port}
     originRequest:
       noTLSVerify: true
   - service: http_status:404
 EOF
+        # 启动命令
         CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'"
     else
-        # Token模式：写入Hostname供脚本读取
-        echo "hostname: $argo_domain" > "${work_dir}/tunnel.yml"
+        # === Token 模式 ===
+        # 严格遵守老王逻辑：Token模式下不使用 tunnel.yml 配置 Ingress
+        # 而是直接命令行启动。注意：Cloudflare 后台必须配置 Service: http://localhost:8001
         
-        # ⚠️ 注意：Token模式下，Argo不会读取 tunnel.yml 中的 ingress 规则
-        # 因此，必须提示用户在 Cloudflare 后台修改 Service 地址
-        yellow "\n======================================================="
-        yellow "⚠️ 警告：使用 Token 模式 (IPv6环境)"
-        yellow "脚本无法自动修改云端回源地址。"
-        yellow "请务必登录 Cloudflare 后台 -> Tunnels -> Configure -> Public Hostname"
-        yellow "将 Service URL 修改为: ${green}${ORIGIN_SERVICE}${yellow}"
-        yellow "=======================================================\n"
-        reading "确认已在后台修改完成？(按回车继续)" confirm
+        # 移除可能存在的旧 tunnel.yml 防止干扰
+        rm -f "${work_dir}/tunnel.yml"
         
+        # 启动命令 (同老王)
         CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'"
     fi
 
-    if command_exists rc-service; then sed -i "/^command_args=/c\\command_args=\"$CMD_ARGS\"" /etc/init.d/argo
-    else ESCAPED=$(echo "$CMD_ARGS" | sed 's/"/\\"/g'); sed -i "/^ExecStart=/c\\ExecStart=/bin/sh -c \"${CMD_ARGS//\'/}\"" /etc/systemd/system/argo.service; fi
+    # 注入服务
+    if command_exists rc-service; then
+        sed -i "/^command_args=/c\\command_args=\"$CMD_ARGS\"" /etc/init.d/argo
+    else
+        ESCAPED=$(echo "$CMD_ARGS" | sed 's/"/\\"/g')
+        sed -i "/^ExecStart=/c\\ExecStart=/bin/sh -c \"${CMD_ARGS//\'/}\"" /etc/systemd/system/argo.service
+    fi
 
     restart_argo
     green "\n配置完成，正在刷新..." && sleep 3 && get_info
 }
 
-# 菜单
 menu() {
     singbox_status=$(check_singbox 2>/dev/null); nginx_status=$(check_nginx 2>/dev/null); argo_status=$(check_argo 2>/dev/null)
     clear
-    purple "\n=== Argo + VMess + WS (v6融合版) ===\n"
+    purple "\n=== Argo + VMess + WS (复刻老王版) ===\n"
     echo -e "Argo: ${argo_status} | Nginx: ${nginx_status} | Sing-box: ${singbox_status}\n"
     green "1. 安装"
     red "2. 卸载"
@@ -384,7 +380,7 @@ while true; do
             if check_singbox >/dev/null; then yellow "已安装"; create_shortcut; else
                 manage_packages install nginx jq tar openssl lsof coreutils
                 install_singbox
-                if command_exists systemctl; then main_systemd_services; else alpine_openrc_services; change_hosts; rc-service sing-box restart; rc-service argo restart; fi
+                if command_exists systemctl; then main_systemd_services; else alpine_openrc_services; rc-service sing-box restart; rc-service argo restart; fi
                 sleep 5; get_info; add_nginx_conf; create_shortcut
             fi ;;
         2) uninstall_singbox ;;
