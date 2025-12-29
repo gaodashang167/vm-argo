@@ -1,8 +1,9 @@
 #!/bin/bash
 # =========================
-# Argo + VMess + WS 安装脚本 (修改版)
-# 1. 快捷指令改为 hu
-# 2. 修复固定隧道节点信息不更新问题
+# Argo + VMess + WS 安装脚本 (最终修复版)
+# 1. hu 命令修复 (自动从 GitHub 下载副本)
+# 2. 固定隧道配置后自动刷新
+# 3. 增强 UUID 和 域名 读取稳定性
 # =========================
 
 export LANG=en_US.UTF-8
@@ -27,7 +28,8 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
-script_path="${work_dir}/manage.sh" # 定义脚本保存路径
+# 请确保这个地址是你 GitHub 上该文件的真实 raw 地址
+GITHUB_URL="https://raw.githubusercontent.com/gaodashang167/vm-argo/main/vm.sh"
 
 export vmess_port=${PORT:-8001}
 export CFIP=${CFIP:-'cf.877774.xyz'}
@@ -35,13 +37,6 @@ export CFPORT=${CFPORT:-'443'}
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本" && exit 1
-
-# 自动保存当前脚本副本到工作目录，用于快捷指令调用
-if [ -f "$0" ]; then
-    mkdir -p "$work_dir"
-    cat "$0" > "$script_path"
-    chmod +x "$script_path"
-fi
 
 # 检查命令是否存在
 command_exists() {
@@ -310,9 +305,9 @@ EOF
     rc-update add argo default > /dev/null 2>&1
 }
 
-# 生成节点信息 (已修复: 支持读取固定隧道配置)
+# 生成节点信息 (核心修复函数)
 get_info() {
-    # 尝试从配置文件恢复 UUID
+    # 1. 尝试恢复 UUID
     if [ -z "$uuid" ] && [ -f "$config_dir" ]; then
         if command_exists jq; then
             uuid=$(jq -r '.inbounds[0].users[0].uuid' "$config_dir")
@@ -326,24 +321,25 @@ get_info() {
     
     isp=$(curl -s --max-time 2 https://ipapi.co/json | grep -o '"org":"[^"]*"' | cut -d'"' -f4 | sed 's/ /_/g' || echo "VPS")
 
-    # [修复] 优先检测是否有固定隧道配置 (tunnel.yml)
+    # 2. 优先检测是否有固定隧道配置 (从 tunnel.yml 读取)
     argodomain=""
     if [ -f "${work_dir}/tunnel.yml" ]; then
         argodomain=$(grep "hostname:" "${work_dir}/tunnel.yml" | head -1 | awk '{print $2}' | tr -d ' "')
     fi
 
-    # 没找到固定域名再找日志
+    # 3. 如果没找到固定域名，再去找日志里的临时域名
     if [ -z "$argodomain" ]; then
         if [ -f "${work_dir}/argo.log" ]; then
-             # 尝试多次读取
             for i in {1..3}; do
                 argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | head -1)
                 [ -n "$argodomain" ] && break
                 sleep 1
             done
         fi
-        # 还没找到则重启
+        
+        # 如果还是没有，尝试重启Argo并等待
         if [ -z "$argodomain" ]; then
+            purple "未检测到Argo域名，尝试重启服务获取..."
             restart_argo >/dev/null 2>&1
             sleep 5
             argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | head -1)
@@ -352,8 +348,11 @@ get_info() {
         green "\n检测到固定隧道配置，使用域名: ${argodomain}"
     fi
 
+    [ -z "$argodomain" ] && red "获取 Argo 域名失败，请检查服务状态" && return
+
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
+    # 4. 生成 VMess 链接
     VMESS="{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowlnsecure\": \"false\"}"
 
     cat > ${work_dir}/url.txt <<EOF
@@ -510,7 +509,7 @@ uninstall_singbox() {
             rm -rf /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
             rm -rf /etc/nginx/conf.d/sing-box.conf
             
-            # 删除快捷指令
+            # 删除 hu 快捷指令
             rm -f /usr/bin/hu
             
             reading "\n是否卸载 Nginx？(y/n): " choice
@@ -526,30 +525,34 @@ uninstall_singbox() {
     esac
 }
 
-# 创建快捷指令 (修改版：指向本地脚本)
+# 创建快捷指令 (核心修复函数)
 create_shortcut() {
-    # 确保脚本文件存在
-    if [ ! -f "$script_path" ]; then
-         # 如果脚本是通过 pipe 运行的，这里可能为空，所以前面加了自动保存逻辑
-         yellow "正在保存脚本副本..."
-         # 这里假设用户是复制粘贴的，无法获取 $0，但前面已经处理了。
-         # 如果这里依然没有文件，只能报错
-         red "无法保存脚本副本，快捷指令可能无法正常工作。"
-    fi
+    yellow "正在配置快捷指令 hu..."
     
-    cat > "$work_dir/hu_runner.sh" << EOF
-#!/usr/bin/env bash
-if [ -f "$script_path" ]; then
-    bash "$script_path" \$1
+    # 强制下载最新脚本副本保存到本地
+    curl -sLo "$work_dir/manage.sh" "$GITHUB_URL"
+    chmod +x "$work_dir/manage.sh"
+    
+    # 创建 /usr/bin/hu 执行脚本
+    cat > "/usr/bin/hu" << EOF
+#!/bin/bash
+if [ -f "$work_dir/manage.sh" ]; then
+    bash "$work_dir/manage.sh" \$1
 else
-    echo -e "\033[1;91m脚本文件 $script_path 不存在，请重新下载安装。\033[0m"
+    echo -e "\033[1;91m脚本文件丢失，正在尝试重新下载...\033[0m"
+    mkdir -p "$work_dir"
+    curl -sLo "$work_dir/manage.sh" "$GITHUB_URL"
+    chmod +x "$work_dir/manage.sh"
+    bash "$work_dir/manage.sh" \$1
 fi
 EOF
-    chmod +x "$work_dir/hu_runner.sh"
+    chmod +x "/usr/bin/hu"
     
-    ln -sf "$work_dir/hu_runner.sh" /usr/bin/hu
-    
-    [ -s /usr/bin/hu ] && green "\n>>> 快捷指令 hu 创建成功！以后输入 hu 即可打开菜单 <<<\n" || red "\n快捷指令创建失败\n"
+    if [ -s "/usr/bin/hu" ]; then
+        green "\n>>> 快捷指令 hu 创建成功！以后输入 hu 即可打开菜单 <<<\n"
+    else
+        red "\n快捷指令创建失败\n"
+    fi
 }
 
 # Alpine适配
@@ -561,11 +564,11 @@ change_hosts() {
 
 # 查看节点信息
 check_nodes() {
-    # 修复：复用 get_info 的逻辑以确保一致性
+    # 直接调用 get_info 保证逻辑统一
     get_info
 }
 
-# Argo固定隧道配置 (已修复: 自动生成伪造配置以供读取，并自动刷新)
+# Argo固定隧道配置 (修复：自动刷新)
 setup_argo_fixed() {
     clear
     yellow "\n固定隧道可为json或token，端口为${vmess_port}\n"
@@ -573,9 +576,14 @@ setup_argo_fixed() {
     reading "\n请输入你的argo域名: " argo_domain
     reading "请输入你的argo密钥(token或json): " argo_auth
     
+    [ -z "$argo_domain" ] || [ -z "$argo_auth" ] && red "输入不能为空" && return
+    
+    stop_argo >/dev/null 2>&1
+
     if [[ $argo_auth =~ TunnelSecret ]]; then
-        echo $argo_auth > ${work_dir}/tunnel.json
-        cat > ${work_dir}/tunnel.yml << EOF
+        # JSON 方式
+        echo "$argo_auth" > "${work_dir}/tunnel.json"
+        cat > "${work_dir}/tunnel.yml" << EOF
 tunnel: $(cut -d\" -f12 <<< "$argo_auth")
 credentials-file: ${work_dir}/tunnel.json
 protocol: http2
@@ -589,20 +597,19 @@ EOF
         CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --config /etc/sing-box/tunnel.yml run 2>&1'"
 
     elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{100,}$ ]]; then
-        # [修复] Token模式也写入 hostname 到 yml 方便 get_info 读取
+        # Token 方式 (修复: 写入 hostname 供读取)
         echo "hostname: $argo_domain" > "${work_dir}/tunnel.yml"
-        
         CMD_ARGS="-c '/etc/sing-box/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'"
     else
         red "输入的argo密钥格式不正确\n"
         return 1
     fi
 
-    # 应用配置
+    # 更新启动配置
     if command_exists rc-service; then
         sed -i "/^command_args=/c\\command_args=\"$CMD_ARGS\"" /etc/init.d/argo
     else
-        # 转义双引号以免 sed 报错
+        # 针对 Systemd 的双引号转义处理
         ESCAPED_CMD=$(echo "$CMD_ARGS" | sed 's/"/\\"/g')
         sed -i "/^ExecStart=/c\\ExecStart=/bin/sh -c \"${CMD_ARGS//\'/}\"" /etc/systemd/system/argo.service
     fi
@@ -610,9 +617,9 @@ EOF
     restart_argo
     green "\n固定隧道已配置, 域名: $argo_domain"
     
-    yellow "\n正在刷新节点信息..."
+    yellow "正在刷新节点信息..."
     sleep 3
-    # [核心修复] 调用 get_info 立即显示新链接
+    # 核心修复：配置完立即显示新链接
     get_info
 }
 
