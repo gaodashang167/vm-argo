@@ -635,8 +635,16 @@ manage_argo() {
     skyblue "-----------"
     reading "\n请输入选择: " argo_choice
     case "${argo_choice}" in
-        1)  start_argo ;;
-        2)  stop_argo ;; 
+        1)  
+            start_argo 
+            read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
+            manage_argo
+            ;;
+        2)  
+            stop_argo
+            read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
+            manage_argo
+            ;; 
         3)  
             clear
             if command_exists rc-service 2>/dev/null; then
@@ -644,7 +652,9 @@ manage_argo() {
             else
                 grep -q 'ExecStart=.*--url http://localhost' /etc/systemd/system/argo.service && get_quick_tunnel && change_argo_domain || { green "\n当前使用固定隧道,无需获取临时域名\n"; sleep 2; }
             fi
-         ;; 
+            read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
+            manage_argo
+            ;; 
         4)
             clear
             yellow "\n固定隧道可为json或token，固定隧道端口为${vmess_port}，请自行在cf后台设置\n\njson在f佬维护的站点里获取，获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
@@ -688,8 +698,9 @@ EOF
             else
                 yellow "你输入的argo域名或token不匹配，请重新输入\n"
                 sleep 2
-                manage_argo            
             fi
+            read -n 1 -s -r -p \033[1;91m按任意键返回...\033[0m'
+            manage_argo
             ;; 
         5)
             clear
@@ -700,7 +711,9 @@ EOF
                 main_systemd_services
             fi
             get_quick_tunnel
-            change_argo_domain 
+            change_argo_domain
+            read -n 1 -s -r -p \033[1;91m按任意键返回...\033[0m'
+            manage_argo
             ;; 
 
         6)  
@@ -720,12 +733,19 @@ EOF
                     yellow "当前使用固定隧道，无法获取临时隧道\n"
                     sleep 2
                 fi
-            fi 
+            fi
+            read -n 1 -s -r -p \033[1;91m按任意键返回...\033[0m'
+            manage_argo
             ;; 
-        0)  return ;; 
-        *)  red "无效的选项！\n" && sleep 1 && manage_argo ;;
+        0)  
+            return
+            ;; 
+        *)  
+            red "无效的选项！\n"
+            sleep 1
+            manage_argo
+            ;;
     esac
-    read -n 1 -s -r -p \033[1;91m按任意键返回...\033[0m'
 }
 
 # 主菜单
@@ -784,17 +804,27 @@ while true; do
                 create_shortcut
             fi
             ;;
-        2) uninstall_singbox ;;
-        3) manage_argo ;;
-        4) check_nodes ;;
+        2) 
+            uninstall_singbox
+            ;;
+        3) 
+            manage_argo
+            ;;
+        4) 
+            check_nodes
+            ;;
         5) 
             restart_singbox
             restart_argo
             restart_nginx
             green "\n所有服务已重启\n"
             ;;
-        0) exit 0 ;;
-        *) red "无效的选项，请输入 0-5\n" ;;
+        0) 
+            exit 0
+            ;;
+        *) 
+            red "无效的选项，请输入 0-5\n"
+            ;;
     esac
     read -n 1 -s -r -p \033[1;91m按任意键返回...\033[0m'
 done
